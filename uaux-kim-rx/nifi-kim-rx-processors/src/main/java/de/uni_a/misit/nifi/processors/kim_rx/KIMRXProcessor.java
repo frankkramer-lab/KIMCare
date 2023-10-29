@@ -37,14 +37,19 @@ import org.apache.nifi.processor.util.StandardValidators;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.text.DateFormat;
+import java.text.ParseException;
 import java.util.*;
 import java.util.regex.Pattern;
 
 @Tags({"KIM", "Telematik", "KoPS"})
-@CapabilityDescription("Polls a POP3 server mail and forwards the latest tagged mail as a flow file")
+@CapabilityDescription("Polls a POP3 server mail and forwards the tagged mails as flow files")
 @SeeAlso({})
-@ReadsAttributes({@ReadsAttribute(attribute="", description="")})
-@WritesAttributes({@WritesAttribute(attribute="", description="")})
+@ReadsAttributes({@ReadsAttribute(attribute="ignore_mails_until", description="Ignore all mails with a sent date equal or older than provided. The date is parsed by the local DateInstance object. Such mails are not affected by delete_mails.")})
+@WritesAttributes({
+    @WritesAttribute(attribute="filename", description="Filename of the attached content"),
+    @WritesAttribute(attribute="sent", description="Sent date of the received mail, default formatting by local DateInstance"),
+})
 public class KIMRXProcessor extends AbstractProcessor {
     // Regex from https://stackoverflow.com/a/201378
     // private static final Pattern EMAIL_ADDRESS_REGEX_PATTERN = Pattern.compile("(?:[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*|\"(?:[\\x01-\\x08\\x0b\\x0c\\x0e-\\x1f\\x21\\x23-\\x5b\\x5d-\\x7f]|\\\\[\\x01-\\x09\\x0b\\x0c\\x0e-\\x7f])*\")@(?:(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?|\\[(?:(?:(2(5[0-5]|[0-4][0-9])|1[0-9][0-9]|[1-9]?[0-9]))\\.){3}(?:(2(5[0-5]|[0-4][0-9])|1[0-9][0-9]|[1-9]?[0-9])|[a-z0-9-]*[a-z0-9]:(?:[\\x01-\\x08\\x0b\\x0c\\x0e-\\x1f\\x21-\\x5a\\x53-\\x7f]|\\\\[\\x01-\\x09\\x0b\\x0c\\x0e-\\x7f])+)\\])");
@@ -67,7 +72,7 @@ public class KIMRXProcessor extends AbstractProcessor {
             .displayName("Mail subject text tag")
             .description("Only mails with provided tag will be considered, e.g. [STUDY_KIM1]")
             .required(true)
-            .defaultValue("KIM TX [KIM_DEMO_TAG]")
+            .defaultValue("[KIM_DEMO_TAG]")
             .addValidator(StandardValidators.NON_BLANK_VALIDATOR)
             .build();
 
@@ -75,6 +80,16 @@ public class KIMRXProcessor extends AbstractProcessor {
             .Builder().name("KIMRX_DELETE_MAILS")
             .displayName("Delete matching mails after processing")
             .description("Delete all matching mails on the POP3 server after the mails have been read")
+            .allowableValues("true", "false")
+            .defaultValue("true")
+            .addValidator(StandardValidators.BOOLEAN_VALIDATOR)
+            .required(true)
+            .build();
+
+    public static final PropertyDescriptor KIMRX_EMIT_MOST_RECENT_ONLY = new PropertyDescriptor
+            .Builder().name("KIMRX_EMIT_MOST_RECENT_ONLY")
+            .displayName("Only emit most recent file")
+            .description("If true, only the latest mail attachment content is emitted. If disabled, multiple flow files are emitted.")
             .allowableValues("true", "false")
             .defaultValue("true")
             .addValidator(StandardValidators.BOOLEAN_VALIDATOR)
@@ -140,6 +155,7 @@ public class KIMRXProcessor extends AbstractProcessor {
             .Builder()
             .name("no-new-mail")
             .description("No new mail with updated files were found.")
+            .autoTerminateDefault(true)
             .build();
     public static final Relationship RELATIONSHIP_FAILURE = new Relationship
             .Builder()
@@ -156,6 +172,7 @@ public class KIMRXProcessor extends AbstractProcessor {
         descriptors.add(KIMRX_MAIL_FROM);
         descriptors.add(KIMRX_TAG);
         descriptors.add(KIMRX_DELETE_MAILS);
+        descriptors.add(KIMRX_EMIT_MOST_RECENT_ONLY);
         descriptors.add(KIMRX_POP3_SERVER_HOST);
         descriptors.add(KIMRX_POP3_SERVER_PORT);
         descriptors.add(KIMRX_POP3_SERVER_AUTH_USERNAME);
@@ -188,15 +205,15 @@ public class KIMRXProcessor extends AbstractProcessor {
 
     @Override
     public void onTrigger(final ProcessContext context, final ProcessSession session) {
-        FlowFile flowFile = session.get();
-        if (flowFile == null) {
-            flowFile = session.create();
-        }
+        // We do not need the incoming session flow file because we emit our own flow files here.
+        // Only for the case of no new mails or errors we re-use the existing flow file.
+        FlowFile session_flowFile = session.get();
 
-        // Obtain descriptor settings
+        // obtain descriptor settings
         String mail_from = context.getProperty(KIMRX_MAIL_FROM).getValue();
         String mail_tag = context.getProperty(KIMRX_TAG).getValue();
         boolean delete_mails = context.getProperty(KIMRX_DELETE_MAILS).asBoolean();
+        boolean most_recent_only = context.getProperty(KIMRX_EMIT_MOST_RECENT_ONLY).asBoolean();
         String forced_attachment_filename = context.getProperty(KIMRX_MAIL_ATTACH_FORCE_FILENAME).getValue();
 
         String pop3_host = context.getProperty(KIMRX_POP3_SERVER_HOST).getValue();
@@ -204,6 +221,15 @@ public class KIMRXProcessor extends AbstractProcessor {
         String auth_username = context.getProperty(KIMRX_POP3_SERVER_AUTH_USERNAME).getValue();
         String auth_password = context.getProperty(KIMRX_POP3_SERVER_AUTH_PASSWORD).getValue();
         boolean allow_insecure_tls = context.getProperty(KIMRX_POP3_SERVER_AUTH_ALLOW_INSECURE_TLS_CONTEXT).asBoolean();
+
+        // setup date and get potential date threshold; Older mails are not deleted even if delete_mails is enabled!
+        DateFormat dateInstance = DateFormat.getDateInstance();
+        Date ignore_until = null;
+        try{
+            ignore_until = dateInstance.parse(
+                session_flowFile.getAttribute("ignore_mails_until")
+            );
+        } catch (NullPointerException | ParseException ignored) { }
 
         // init tag pattern for match
         Pattern tag_pattern = Pattern.compile(Pattern.quote(mail_tag));
@@ -257,6 +283,14 @@ public class KIMRXProcessor extends AbstractProcessor {
                     continue;
                 }
 
+                if (msg.getSentDate() == null) {
+                    // ignore mails without sent date header
+                    continue;
+                } else if (ignore_until != null && !msg.getSentDate().after(ignore_until)){
+                    // message is older than the provided threshold
+                    continue;
+                }
+
                 if (POP3MessageUtil.findFileAttachmentFromMimeBodyPart(msg.getContent()) == null) {
                     // the message lacks an attachment
                     continue;
@@ -267,11 +301,12 @@ public class KIMRXProcessor extends AbstractProcessor {
 
             if (matches.isEmpty()) {
                 // we signal a no-new-mails event
-                session.transfer(flowFile, RELATIONSHIP_NO_NEW_MAIL);
+                session.transfer(session.create(), RELATIONSHIP_NO_NEW_MAIL);
             } else {
+                // sort from oldest (0) to recent (n)
                 matches.sort((m1, m2) -> {
                     try {
-                        return - (m1.getSentDate().compareTo(m2.getSentDate()));
+                        return m1.getSentDate().compareTo(m2.getSentDate());
                     } catch (MessagingException e) {
                         return 0;
                     }
@@ -279,8 +314,10 @@ public class KIMRXProcessor extends AbstractProcessor {
 
                 for (int i = 0; i<matches.size(); i++) {
                     Message msg = matches.get(i);
-                    if (i == 0) {
-                        // we have the most recent flow file
+                    if (most_recent_only && i < (matches.size() - 1)) {
+                        // We only want to emit the most recent mail, so we ignore the previous mails
+                    } else {
+                        // Extract the attachment
                         MimeBodyPart attachment_part = POP3MessageUtil.findFileAttachmentFromMimeBodyPart(msg.getContent());
                         String filename = attachment_part.getFileName();
                         if (filename == null && forced_attachment_filename != null) {
@@ -289,7 +326,8 @@ public class KIMRXProcessor extends AbstractProcessor {
                             filename = "data.bin";
                         }
 
-                        // write to flow file
+                        // write to new flow file
+                        FlowFile flowFile = session.create();
                         session.write(flowFile, outputStream -> {
                             try {
                                 InputStream is = attachment_part.getInputStream();
@@ -302,27 +340,38 @@ public class KIMRXProcessor extends AbstractProcessor {
                                 throw new RuntimeException(e);
                             }
                         });
-                        // set filename
+
+                        // set filename and sent date
                         session.putAttribute(flowFile, "filename", filename);
+                        session.putAttribute(flowFile, "sent", DateFormat.getDateInstance().format(msg.getSentDate()));
+                        // emit the flow file
+                        session.transfer(flowFile, RELATIONSHIP_SUCCESS);
                     }
+
                     // remove mails if desired
                     if (delete_mails) {
                         msg.setFlag(Flags.Flag.DELETED, true);
                     }
                 }
-                session.transfer(flowFile, RELATIONSHIP_SUCCESS);
             }
 
             if (inbox.isOpen()) inbox.close();
             if (store.isConnected()) store.close();
 
         } catch (MessagingException | IOException e) {
+            // signal a failure event
+            FlowFile flowFile = session.create();
             session.penalize(flowFile);
             session.transfer(flowFile, RELATIONSHIP_FAILURE);
         } finally {
             // close open sessions
             try { if (inbox != null && inbox.isOpen()) { inbox.close(true);} } catch (MessagingException ignored) {}
             try { if (store != null && store.isConnected()) { store.close(); } } catch (MessagingException ignored) {}
+        }
+
+        // cleanup session flow file if it was provided
+        if (session_flowFile != null) {
+            session.remove(session_flowFile);
         }
 
         session.commit();
